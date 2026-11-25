@@ -31,7 +31,7 @@ export class RanobesPlugin implements Plugin.PluginBase {
     this.name = metadata.sourceName;
     this.icon = 'multisrc/ranobes/ranobes/icon.png';
     this.site = metadata.sourceSite;
-    this.version = '2.0.4';
+    this.version = '2.0.5';
     this.options = metadata.options as RanobesOptions;
   }
 
@@ -115,6 +115,20 @@ export class RanobesPlugin implements Plugin.PluginBase {
     parser.write(html);
     parser.end();
     return novels;
+  }
+
+  // says what was received, the bare JSON.parse error does not
+  parseChapterData(json: string): ChapterListData {
+    try {
+      return JSON.parse(json.replace(/;\s*$/, ''));
+    } catch (e) {
+      throw new Error(
+        'Ranobes: unreadable chapter list (' +
+          (e as Error).message +
+          '): ' +
+          json.slice(0, 80),
+      );
+    }
   }
 
   parseChapters(data: { chapters: ChapterEntry[] }) {
@@ -509,16 +523,20 @@ export class RanobesPlugin implements Plugin.PluginBase {
     let chapters: Plugin.ChapterItem[] = [];
     let tempchapter: Plugin.ChapterItem = {};
     const fixDate = this.parseDate;
+    const parseChapterData = (json: string) => this.parseChapterData(json);
 
     let dataJson: ChapterListData = { pages_count: '', chapters: [] };
 
     // current markup: the list is a JSON block that a Vue template renders,
     // `window.__DATA__` only points to it
-    const dataBlock = pageBody.match(
-      /<script[^>]*id=["']chapters-data["'][^>]*>([\s\S]*?)<\/script>/,
-    )?.[1];
+    // the id may be quoted or not depending on how the page is minified
+    const dataBlock = pageBody
+      .match(
+        /<script\b[^>]*\bid=["']?chapters-data(?:["'\s][^>]*)?>([\s\S]*?)<\/script>/i,
+      )?.[1]
+      ?.trim();
     if (dataBlock) {
-      dataJson = JSON.parse(dataBlock);
+      dataJson = this.parseChapterData(dataBlock);
     }
 
     const parser = new Parser({
@@ -540,9 +558,12 @@ export class RanobesPlugin implements Plugin.PluginBase {
       ontext(data) {
         if (isChapterDate) tempchapter.releaseTime = fixDate(data.trim());
         // older markup: the JSON is inlined after `window.__DATA__ =`
+        // only an inline object literal, not the current
+        // `window.__DATA__ = JSON.parse(...)` pointer to the data block
         if (isScript && !dataBlock) {
-          if (data.includes('window.__DATA__ =')) {
-            dataJson = JSON.parse(data.replace('window.__DATA__ =', ''));
+          const inline = data.match(/window\.__DATA__\s*=\s*(\{[\s\S]*\})/);
+          if (inline) {
+            dataJson = parseChapterData(inline[1]);
           }
         }
       },
