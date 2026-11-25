@@ -31,7 +31,7 @@ export class RanobesPlugin implements Plugin.PluginBase {
     this.name = metadata.sourceName;
     this.icon = 'multisrc/ranobes/ranobes/icon.png';
     this.site = metadata.sourceSite;
-    this.version = '2.0.3';
+    this.version = '2.0.4';
     this.options = metadata.options as RanobesOptions;
   }
 
@@ -122,7 +122,8 @@ export class RanobesPlugin implements Plugin.PluginBase {
     data.chapters.map((item: ChapterEntry) => {
       chapter.push({
         name: item.title,
-        releaseTime: new Date(item.date).toISOString(),
+        // "YYYY-MM-DD HH:MM:SS": Hermes only parses the ISO "T" separator
+        releaseTime: new Date(item.date.replace(' ', 'T')).toISOString(),
         path: item.link.slice(this.site.length),
       });
     });
@@ -410,9 +411,20 @@ export class RanobesPlugin implements Plugin.PluginBase {
     const to = Math.min(toc.total, size * page) - 1;
     if (from > to) return [];
 
-    // site page p holds newest-first positions [size * (p - 1), size * p)
-    const firstSitePage = Math.floor((toc.total - 1 - to) / size) + 1;
-    const lastSitePage = Math.floor((toc.total - 1 - from) / size) + 1;
+    // Site page 1 holds the newest `firstCount` chapters (newest-first
+    // positions [0, firstCount)) and every later page holds `size`, so page
+    // p >= 2 starts at position firstCount + size * (p - 2). This covers both
+    // layouts: a full first page (firstCount === size) and the current one,
+    // where page 1 is the partial one and older pages stay fixed.
+    const firstCount = toc.newest.length;
+    const startOf = (sitePage: number) =>
+      sitePage === 1 ? 0 : firstCount + size * (sitePage - 2);
+    const sitePageOf = (position: number) =>
+      position < firstCount
+        ? 1
+        : Math.floor((position - firstCount) / size) + 2;
+    const firstSitePage = sitePageOf(toc.total - 1 - to);
+    const lastSitePage = sitePageOf(toc.total - 1 - from);
     const result: Plugin.ChapterItem[] = [];
 
     for (let sitePage = firstSitePage; sitePage <= lastSitePage; sitePage++) {
@@ -422,7 +434,7 @@ export class RanobesPlugin implements Plugin.PluginBase {
           ? toc.newest
           : (await this.fetchChapterList(toc.chaptersPath, sitePage)).chapters;
       list.forEach((chapter, position) => {
-        const index = toc.total - 1 - (size * (sitePage - 1) + position);
+        const index = toc.total - 1 - (startOf(sitePage) + position);
         if (index >= from && index <= to) result[index - from] = chapter;
       });
     }
@@ -457,19 +469,23 @@ export class RanobesPlugin implements Plugin.PluginBase {
 
   async buildToc(novelPath: string, chaptersPath: string): Promise<Toc> {
     const first = await this.fetchChapterList(chaptersPath, 1);
-    // every site page but the last one is full (25 chapters on both sites)
-    const pageSize =
-      first.pagesCount > 1 ? first.chapters.length : SITE_PAGE_SIZE;
-    const lastPageCount =
-      first.pagesCount > 1
-        ? (await this.fetchChapterList(chaptersPath, first.pagesCount)).chapters
-            .length
-        : first.chapters.length;
+    const firstCount = first.chapters.length;
+    let pageSize = SITE_PAGE_SIZE;
+    let total = firstCount;
+    if (first.pagesCount > 1) {
+      const lastPageCount = (
+        await this.fetchChapterList(chaptersPath, first.pagesCount)
+      ).chapters.length;
+      // Either the first or the last site page is the partial one (it used
+      // to be the last, now it is the first), every page between is full.
+      pageSize = Math.max(firstCount, lastPageCount);
+      total = firstCount + pageSize * (first.pagesCount - 2) + lastPageCount;
+    }
     const toc: Toc = {
       novelPath,
       chaptersPath,
       pageSize,
-      total: pageSize * (first.pagesCount - 1) + lastPageCount,
+      total,
       newest: first.chapters,
     };
     this.tocCache[novelPath] = toc;
@@ -494,10 +510,16 @@ export class RanobesPlugin implements Plugin.PluginBase {
     let tempchapter: Plugin.ChapterItem = {};
     const fixDate = this.parseDate;
 
-    let dataJson: {
-      pages_count: string;
-      chapters: ChapterEntry[];
-    } = { pages_count: '', chapters: [] };
+    let dataJson: ChapterListData = { pages_count: '', chapters: [] };
+
+    // current markup: the list is a JSON block that a Vue template renders,
+    // `window.__DATA__` only points to it
+    const dataBlock = pageBody.match(
+      /<script[^>]*id=["']chapters-data["'][^>]*>([\s\S]*?)<\/script>/,
+    )?.[1];
+    if (dataBlock) {
+      dataJson = JSON.parse(dataBlock);
+    }
 
     const parser = new Parser({
       onopentag(name, attribs) {
@@ -517,7 +539,8 @@ export class RanobesPlugin implements Plugin.PluginBase {
       },
       ontext(data) {
         if (isChapterDate) tempchapter.releaseTime = fixDate(data.trim());
-        if (isScript) {
+        // older markup: the JSON is inlined after `window.__DATA__ =`
+        if (isScript && !dataBlock) {
           if (data.includes('window.__DATA__ =')) {
             dataJson = JSON.parse(data.replace('window.__DATA__ =', ''));
           }
@@ -558,7 +581,7 @@ export class RanobesPlugin implements Plugin.PluginBase {
       .slice(1)
       .map(rest => parseInt(rest, 10) || 1);
     const pagesCount = Math.max(
-      parseInt(dataJson.pages_count, 10) || 1,
+      parseInt(String(dataJson.pages_count), 10) || 1,
       sitePage,
       ...pageLinks,
     );
@@ -603,10 +626,16 @@ export class RanobesPlugin implements Plugin.PluginBase {
 }
 
 type ChapterEntry = {
-  id: number;
+  id: number | string;
   title: string;
   date: string;
   link: string;
+};
+
+type ChapterListData = {
+  // a string in the older inline JSON, a number in the `chapters-data` block
+  pages_count: string | number;
+  chapters: ChapterEntry[];
 };
 
 type Toc = {
